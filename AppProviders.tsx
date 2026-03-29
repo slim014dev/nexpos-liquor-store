@@ -16,13 +16,15 @@
 //   }
 //
 // Provider order matters:
-//   InventoryProvider → outermost: product data exists before cart is aware
+//   MpesaProvider     → outermost: no deps on cart/inventory
+//   InventoryProvider → middle: product data exists before cart is aware
 //   CartProvider      → innermost: can safely reference inventory if needed
 // =============================================================================
 
 import React, { type ReactNode } from "react";
 import { InventoryProvider } from "./InventoryContext";
 import { CartProvider } from "./CartContext";
+import { MpesaProvider } from "./MpesaContext";
 
 interface AppProvidersProps {
   children: ReactNode;
@@ -32,10 +34,12 @@ interface AppProvidersProps {
 
 export function AppProviders({ children, taxRate }: AppProvidersProps) {
   return (
-    <InventoryProvider>
-      <CartProvider taxRate={taxRate}>
-        {children}
-      </CartProvider>
-    </InventoryProvider>
+    <MpesaProvider>
+      <InventoryProvider>
+        <CartProvider taxRate={taxRate}>
+          {children}
+        </CartProvider>
+      </InventoryProvider>
+    </MpesaProvider>
   );
 }

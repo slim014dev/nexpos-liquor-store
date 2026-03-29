@@ -96,7 +96,14 @@ export interface CartLineItem {
 }
 
 /** Payment methods accepted at the register. */
-export type PaymentMethod = "cash" | "card" | "split";
+export type PaymentMethod = "cash" | "card" | "split" | "mpesa";
+
+/**
+ * Status of the M-Pesa STK Push for the current transaction.
+ * Mirrors StkStatus in MpesaContext but lives on the cart so the receipt
+ * can be stored independently of the Mpesa hook's ephemeral state.
+ */
+export type MpesaPaymentStatus = "idle" | "pending" | "confirmed" | "failed";
 
 /** Status of the current transaction. */
 export type TransactionStatus =
@@ -150,6 +157,24 @@ export interface CartState {
    */
   tenderedInCents: number | null;
 
+  // --- M-Pesa STK Push fields -----------------------------------------------
+
+  /**
+   * Daraja CheckoutRequestID returned after a successful STK Push.
+   * Used to poll for payment status and stored on the receipt.
+   * null when M-Pesa is not the payment method or push not yet sent.
+   */
+  mpesaCheckoutRequestId: string | null;
+
+  /**
+   * Current status of the M-Pesa payment flow for this transaction.
+   * "idle"      → M-Pesa not initiated
+   * "pending"   → STK Push sent, waiting for customer PIN
+   * "confirmed" → Payment received by M-Pesa ✅
+   * "failed"    → Customer cancelled, timed out, or Daraja error ❌
+   */
+  mpesaStatus: MpesaPaymentStatus;
+
   /**
    * Completed transaction receipt snapshot.
    * Populated only after `status === "completed"`.
@@ -168,8 +193,12 @@ export interface CompletedReceipt {
   totalInCents: number;
   paymentMethod: PaymentMethod;
   tenderedInCents: number | null;
-  changeInCents: number | null;      // null for card payments
+  changeInCents: number | null;      // null for card / M-Pesa payments
   completedAt: string;
+  /** M-Pesa receipt number (e.g. "RBK71BJ3Z1"). null for non-M-Pesa payments. */
+  mpesaReceiptNumber: string | null;
+  /** Daraja CheckoutRequestID. null for non-M-Pesa payments. */
+  mpesaCheckoutRequestId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +261,10 @@ type CartAction =
         discountInCents: number;
         taxInCents: number;
         totalInCents: number;
+        /** M-Pesa receipt number — required when paymentMethod === "mpesa". */
+        mpesaReceiptNumber?: string;
+        /** Daraja CheckoutRequestID — required when paymentMethod === "mpesa". */
+        mpesaCheckoutRequestId?: string;
       };
     }
 
@@ -246,7 +279,29 @@ type CartAction =
   | { type: "HOLD_TRANSACTION" }
 
   /** Clear the cart and start a brand-new transaction. */
-  | { type: "NEW_TRANSACTION" };
+  | { type: "NEW_TRANSACTION" }
+
+  /**
+   * Record that an M-Pesa STK Push was sent for this transaction.
+   * Stores the CheckoutRequestID and sets mpesaStatus → "pending".
+   */
+  | { type: "MPESA_PUSH_INITIATED"; payload: { checkoutRequestId: string } }
+
+  /**
+   * M-Pesa payment confirmed by Daraja callback / poll.
+   * Stores the receipt number and sets mpesaStatus → "confirmed".
+   * The checkout UI should call checkout("mpesa") immediately after.
+   */
+  | {
+      type: "MPESA_PAYMENT_CONFIRMED";
+      payload: { mpesaReceiptNumber: string; checkoutRequestId: string };
+    }
+
+  /**
+   * M-Pesa payment failed or was cancelled by the customer.
+   * Resets mpesaStatus → "failed" so the cashier can retry or switch method.
+   */
+  | { type: "MPESA_PAYMENT_FAILED" };
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -269,6 +324,8 @@ const createFreshTransaction = (): CartState => ({
   openedAt: new Date().toISOString(),
   paymentMethod: null,
   tenderedInCents: null,
+  mpesaCheckoutRequestId: null,
+  mpesaStatus: "idle",
   receipt: null,
 });
 
@@ -446,6 +503,8 @@ function cartReducer(state: CartState, action: CartAction): CartState {
         discountInCents,
         taxInCents,
         totalInCents,
+        mpesaReceiptNumber   = null,
+        mpesaCheckoutRequestId = null,
       } = action.payload;
 
       const changeInCents =
@@ -464,6 +523,8 @@ function cartReducer(state: CartState, action: CartAction): CartState {
         tenderedInCents: tenderedInCents ?? null,
         changeInCents,
         completedAt: new Date().toISOString(),
+        mpesaReceiptNumber: mpesaReceiptNumber ?? null,
+        mpesaCheckoutRequestId: mpesaCheckoutRequestId ?? null,
       };
 
       return {
@@ -471,7 +532,36 @@ function cartReducer(state: CartState, action: CartAction): CartState {
         status: "completed",
         paymentMethod,
         tenderedInCents: tenderedInCents ?? null,
+        mpesaStatus: paymentMethod === "mpesa" ? "confirmed" : state.mpesaStatus,
         receipt,
+      };
+    }
+
+    case "MPESA_PUSH_INITIATED": {
+      if (!isOpen) return state;
+      return {
+        ...state,
+        mpesaCheckoutRequestId: action.payload.checkoutRequestId,
+        mpesaStatus: "pending",
+      };
+    }
+
+    case "MPESA_PAYMENT_CONFIRMED": {
+      if (!isOpen) return state;
+      // Status is stored here; the UI will then call checkout("mpesa") to
+      // finalise the transaction with the receipt number.
+      return {
+        ...state,
+        mpesaCheckoutRequestId: action.payload.checkoutRequestId,
+        mpesaStatus: "confirmed",
+      };
+    }
+
+    case "MPESA_PAYMENT_FAILED": {
+      return {
+        ...state,
+        mpesaStatus: "failed",
+        mpesaCheckoutRequestId: null,
       };
     }
 
@@ -552,6 +642,12 @@ interface CartContextValue {
   tenderedInCents: number | null;
   receipt: CompletedReceipt | null;
 
+  // ----- M-Pesa State -----
+  /** Daraja CheckoutRequestID for the in-progress M-Pesa push (if any). */
+  mpesaCheckoutRequestId: string | null;
+  /** Current M-Pesa payment status for this transaction. */
+  mpesaStatus: MpesaPaymentStatus;
+
   // ----- Memoised Totals -----
   /** Sum of all line totals (post line-discounts, pre order-discount). */
   subtotalInCents: number;
@@ -590,14 +686,27 @@ interface CartContextValue {
    * The caller is responsible for:
    *   1. Calling this to finalise the cart.
    *   2. Calling inventory.adjustStock() for each line item separately.
+   *
+   * For M-Pesa payments, pass mpesaReceiptNumber and mpesaCheckoutRequestId
+   * so they are stored on the receipt snapshot.
    */
   checkout: (
     paymentMethod: PaymentMethod,
-    tenderedInCents?: number
+    tenderedInCents?: number,
+    mpesaReceiptNumber?: string,
+    mpesaCheckoutRequestId?: string
   ) => void;
   voidTransaction: () => void;
   holdTransaction: () => void;
   newTransaction: () => void;
+
+  // ----- M-Pesa Actions -----
+  /** Record that an STK Push was sent for this transaction. */
+  mpesaPushInitiated: (checkoutRequestId: string) => void;
+  /** Record that the M-Pesa payment was confirmed. */
+  mpesaPaymentConfirmed: (mpesaReceiptNumber: string, checkoutRequestId: string) => void;
+  /** Mark the M-Pesa attempt as failed so the cashier can retry. */
+  mpesaPaymentFailed: () => void;
 }
 
 const CartContext = createContext<CartContextValue | null>(null);
@@ -718,7 +827,12 @@ export function CartProvider({ children, taxRate }: CartProviderProps) {
   }, []);
 
   const checkout = useCallback(
-    (paymentMethod: PaymentMethod, tenderedInCents?: number) => {
+    (
+      paymentMethod: PaymentMethod,
+      tenderedInCents?: number,
+      mpesaReceiptNumber?: string,
+      mpesaCheckoutRequestId?: string
+    ) => {
       dispatch({
         type: "CHECKOUT",
         payload: {
@@ -728,11 +842,31 @@ export function CartProvider({ children, taxRate }: CartProviderProps) {
           discountInCents: orderDiscountAmountInCents,
           taxInCents,
           totalInCents,
+          mpesaReceiptNumber,
+          mpesaCheckoutRequestId,
         },
       });
     },
     [subtotalInCents, orderDiscountAmountInCents, taxInCents, totalInCents]
   );
+
+  const mpesaPushInitiated = useCallback((checkoutRequestId: string) => {
+    dispatch({ type: "MPESA_PUSH_INITIATED", payload: { checkoutRequestId } });
+  }, []);
+
+  const mpesaPaymentConfirmed = useCallback(
+    (mpesaReceiptNumber: string, checkoutRequestId: string) => {
+      dispatch({
+        type: "MPESA_PAYMENT_CONFIRMED",
+        payload: { mpesaReceiptNumber, checkoutRequestId },
+      });
+    },
+    []
+  );
+
+  const mpesaPaymentFailed = useCallback(() => {
+    dispatch({ type: "MPESA_PAYMENT_FAILED" });
+  }, []);
 
   const voidTransaction = useCallback(() => {
     dispatch({ type: "VOID_TRANSACTION" });
@@ -759,6 +893,8 @@ export function CartProvider({ children, taxRate }: CartProviderProps) {
       paymentMethod: state.paymentMethod,
       tenderedInCents: state.tenderedInCents,
       receipt: state.receipt,
+      mpesaCheckoutRequestId: state.mpesaCheckoutRequestId,
+      mpesaStatus: state.mpesaStatus,
       subtotalInCents,
       orderDiscountAmountInCents,
       taxInCents,
@@ -779,6 +915,9 @@ export function CartProvider({ children, taxRate }: CartProviderProps) {
       voidTransaction,
       holdTransaction,
       newTransaction,
+      mpesaPushInitiated,
+      mpesaPaymentConfirmed,
+      mpesaPaymentFailed,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [state, subtotalInCents, orderDiscountAmountInCents, taxInCents, totalInCents, itemCount, canCheckout]
